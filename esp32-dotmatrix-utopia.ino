@@ -77,15 +77,23 @@ public:
     }
 
     bool shouldUpdate() {
-        return isActive && (millis() - lastUpdateTime > REFRESH_INTERVAL);
+        unsigned long currentTime = millis();
+        bool timeToUpdate = (currentTime - lastUpdateTime > REFRESH_INTERVAL);
+        Serial.printf("Time since last update: %lu ms, Should update: %d\n", 
+                     currentTime - lastUpdateTime, timeToUpdate);
+        return isActive && timeToUpdate;
     }
 
     void markUpdated() {
         lastUpdateTime = millis();
+        Serial.println("Display update marked at: " + String(lastUpdateTime));
     }
 
     void sleep() {
+        Serial.println("Entering deep sleep mode...");
         isActive = false;
+        display->clearScreen();  // Clear display before sleep
+        display->setBrightness8(0);  // Turn off display
         esp_sleep_enable_timer_wakeup(SLEEP_DURATION);
         esp_deep_sleep_start();
     }
@@ -93,12 +101,14 @@ public:
     void activate() {
         isActive = true;
         display->setBrightness8(BRIGHTNESS);
+        Serial.println("Display activated");
     }
 
     void showDebugMessage(const String& msg) {
         display->clearScreen();
         setTextColor(15, 0, 0);  // Bright red for debug
         drawText(msg, 2, 2);
+        Serial.println("Debug message: " + msg);
     }
 };
 
@@ -166,16 +176,40 @@ public:
     static bool isActiveHours() {
         struct tm timeinfo;
         if (!getLocalTime(&timeinfo)) {
-            Serial.println("Failed to get time");
-            return true;  // Default to active if time fetch fails
+            Serial.println("Failed to get time - check NTP connection");
+            display.showDebugMessage("Time Error");
+            return false;  // Changed to false to prevent always-on behavior
         }
-        Serial.printf("Current hour: %d\n", timeinfo.tm_hour);
-        return timeinfo.tm_hour >= ACTIVE_HOURS_START && 
-               timeinfo.tm_hour <= ACTIVE_HOURS_END;
+
+        bool isActive = timeinfo.tm_hour >= ACTIVE_HOURS_START && 
+                       timeinfo.tm_hour < ACTIVE_HOURS_END;  // Changed <= to < for exact cutoff
+        
+        Serial.printf("Current hour: %d, Active hours: %d-%d, Is active: %d\n", 
+                     timeinfo.tm_hour, ACTIVE_HOURS_START, ACTIVE_HOURS_END, isActive);
+        
+        return isActive;
     }
 
-    static void initialize() {
+    static bool initialize() {
         configTime(GMT_OFFSET_SEC, DAYLIGHT_OFFSET_SEC, NTP_SERVER);
+        
+        // Wait for initial time sync with timeout
+        int timeoutCounter = 0;
+        struct tm timeinfo;
+        while (!getLocalTime(&timeinfo) && timeoutCounter < 10) {
+            Serial.println("Waiting for time sync...");
+            delay(1000);
+            timeoutCounter++;
+        }
+        
+        if (timeoutCounter >= 10) {
+            Serial.println("Time sync failed");
+            return false;
+        }
+        
+        Serial.printf("Time initialized. Current time: %02d:%02d:%02d\n", 
+                     timeinfo.tm_hour, timeinfo.tm_min, timeinfo.tm_sec);
+        return true;
     }
 };
 
@@ -197,10 +231,22 @@ void setup() {
         ESP.restart();
     }
     
-    TimeManager::initialize();
-    delay(1000);  // Give time for initial time sync
+    // Initialize time synchronization
+    if (!TimeManager::initialize()) {
+        display.showDebugMessage("Time Sync Failed");
+        delay(3000);
+        ESP.restart();
+    }
     
-    // Force first update
+    // Check if we should be active at startup
+    if (!TimeManager::isActiveHours()) {
+        Serial.println("Outside active hours at startup, going to sleep");
+        display.showDebugMessage("Sleep Time");
+        delay(3000);
+        display.sleep();
+    }
+    
+    // Initial display update if we're active
     String initialMessage = network.fetchMessage();
     if (!initialMessage.isEmpty()) {
         display.updateDisplay(initialMessage);
@@ -218,12 +264,13 @@ void loop() {
             if (!message.isEmpty()) {
                 display.updateDisplay(message);
             }
+            display.markUpdated();
         } else {
             Serial.println("Outside active hours, going to sleep");
+            display.showDebugMessage("Sleep Time");
+            delay(3000);
             display.sleep();
         }
-        
-        display.markUpdated();
     }
     delay(1000);  // Small delay to prevent tight looping
 }
